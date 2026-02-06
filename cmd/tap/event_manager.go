@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/bluesky-social/indigo/cmd/tap/models"
+	"github.com/puzpuzpuz/xsync/v4"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -22,8 +22,7 @@ type EventManager struct {
 	cacheSize       int
 	finishedLoading atomic.Bool
 
-	cache   map[uint]*OutboxEvt
-	cacheLk sync.RWMutex
+	cache *xsync.Map[uint, *OutboxEvt]
 
 	pendingIDs chan uint
 }
@@ -41,9 +40,7 @@ func NewEventManager(logger *slog.Logger, db *gorm.DB, config *TapConfig) *Event
 type DBCallback = func(tx *gorm.DB) error
 
 func (em *EventManager) IsFull() bool {
-	em.cacheLk.RLock()
-	defer em.cacheLk.RUnlock()
-	return len(em.cache) >= em.cacheSize
+	return em.cache.Size() >= em.cacheSize
 }
 
 func (em *EventManager) IsReady() bool {
@@ -69,10 +66,7 @@ func (em *EventManager) WaitForReady(ctx context.Context) {
 }
 
 func (em *EventManager) GetEvent(id uint) (*OutboxEvt, bool) {
-	em.cacheLk.RLock()
-	defer em.cacheLk.RUnlock()
-	evt, exists := em.cache[id]
-	return evt, exists
+	return em.cache.Load(id)
 }
 
 func (em *EventManager) DeleteEvents(ctx context.Context, ids []uint) error {
@@ -84,12 +78,10 @@ func (em *EventManager) DeleteEvents(ctx context.Context, ids []uint) error {
 		return err
 	}
 
-	em.cacheLk.Lock()
-	defer em.cacheLk.Unlock()
 	for _, id := range ids {
-		delete(em.cache, id)
+		em.cache.Delete(id)
 	}
-	eventCacheSize.Set(float64(len(em.cache)))
+	eventCacheSize.Set(float64(em.cache.Size()))
 	return nil
 }
 
@@ -136,7 +128,6 @@ func (em *EventManager) loadEventPage(ctx context.Context, lastID int) (int, err
 		return lastID, nil
 	}
 
-	em.cacheLk.Lock()
 	for i := range dbEvts {
 		entry := &OutboxEvt{
 			ID:    dbEvts[i].ID,
@@ -144,10 +135,9 @@ func (em *EventManager) loadEventPage(ctx context.Context, lastID int) (int, err
 			Live:  dbEvts[i].Live,
 			Event: []byte(dbEvts[i].Data),
 		}
-		em.cache[entry.ID] = entry
+		em.cache.Store(entry.ID, entry)
 	}
-	eventCacheSize.Set(float64(len(em.cache)))
-	em.cacheLk.Unlock()
+	eventCacheSize.Set(float64(em.cache.Size()))
 
 	maxID := dbEvts[len(dbEvts)-1].ID
 	em.nextID.Store(uint64(maxID + 1))
@@ -278,13 +268,11 @@ func (em *EventManager) AddRecordEvents(ctx context.Context, evts []*RecordEvt, 
 		return err
 	}
 
-	em.cacheLk.Lock()
 	for id, entry := range cacheEvts {
 		entryCopy := entry // Create heap copy
-		em.cache[id] = &entryCopy
+		em.cache.Store(id, &entryCopy)
 	}
-	eventCacheSize.Set(float64(len(em.cache)))
-	em.cacheLk.Unlock()
+	eventCacheSize.Set(float64(em.cache.Size()))
 
 	for _, evtID := range evtIDs {
 		em.pendingIDs <- evtID
@@ -314,15 +302,13 @@ func (em *EventManager) AddIdentityEvent(ctx context.Context, evt *IdentityEvt, 
 		return err
 	}
 
-	em.cacheLk.Lock()
-	em.cache[evtID] = &OutboxEvt{
+	em.cache.Store(evtID, &OutboxEvt{
 		ID:    evtID,
 		Did:   evt.Did,
 		Live:  false,
 		Event: jsonData,
-	}
-	eventCacheSize.Set(float64(len(em.cache)))
-	em.cacheLk.Unlock()
+	})
+	eventCacheSize.Set(float64(em.cache.Size()))
 
 	em.pendingIDs <- evtID
 
