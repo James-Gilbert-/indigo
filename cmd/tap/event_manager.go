@@ -32,7 +32,7 @@ func NewEventManager(logger *slog.Logger, db *gorm.DB, config *TapConfig) *Event
 		logger:     logger.With("component", "event_manager"),
 		db:         db,
 		cacheSize:  config.EventCacheSize,
-		cache:      make(map[uint]*OutboxEvt),
+		cache:      xsync.NewMap[uint, *OutboxEvt](),
 		pendingIDs: make(chan uint, config.EventCacheSize*2), // give us some buffer room in channel since we can overshoot
 	}
 }

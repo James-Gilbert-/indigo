@@ -368,15 +368,22 @@ func (fp *FirehoseProcessor) saveCursor(ctx context.Context) error {
 
 // RunCursorSaver periodically saves the firehose cursor to the database.
 func (fp *FirehoseProcessor) RunCursorSaver(ctx context.Context) {
-	runPeriodically(ctx, fp.cursorSaveInterval, func(ctx context.Context) error {
-		if err := fp.saveCursor(ctx); err != nil {
-			fp.logger.Error("failed to save cursor", "error", err, "relayUrl", fp.relayUrl)
-		}
-		return nil // don't exit, just log error
-	})
+	ticker := time.NewTicker(fp.cursorSaveInterval)
+	defer ticker.Stop()
 
-	// save cursor one last time on shutdown
-	if err := fp.saveCursor(ctx); err != nil {
+	for ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+			if err := fp.saveCursor(ctx); err != nil {
+				fp.logger.Error("failed to save cursor", "error", err, "relayUrl", fp.relayUrl)
+			}
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := fp.saveCursor(shutdownCtx); err != nil {
 		fp.logger.Error("failed to save cursor on shutdown", "error", err, "relayUrl", fp.relayUrl)
 	}
 }

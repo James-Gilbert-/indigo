@@ -19,7 +19,7 @@ import (
 // Historical events can be sent concurrently with each other (no ordering
 // between them), but cannot be sent while a live event is in-flight.
 //
-// Example sequence: H1, H2, L1, L2, H3, H4, L2, H5
+// Example sequence: H1, H2, L1, L2, H3, H4, L3, H5
 //   - H1 and H2 sent concurrently
 //   - Wait for H1 and H2 to complete, then send L1 (alone)
 //   - Wait for L1 to complete, then send L2 (alone)
@@ -40,8 +40,6 @@ type Outbox struct {
 
 	acks     chan uint
 	outgoing chan *OutboxEvt
-
-	ctx context.Context
 }
 
 func NewOutbox(logger *slog.Logger, events *EventManager, config *TapConfig) *Outbox {
@@ -67,88 +65,102 @@ func NewOutbox(logger *slog.Logger, events *EventManager, config *TapConfig) *Ou
 
 // Run starts the outbox workers for event delivery and cleanup.
 func (o *Outbox) Run(ctx context.Context) {
-	o.ctx = ctx
+	var wg sync.WaitGroup
 
 	if o.mode == OutboxModeWebsocketAck {
-		go o.checkTimeouts(ctx)
+		wg.Go(func() {
+			ticker := time.NewTicker(o.retryTimeout)
+			defer ticker.Stop()
+
+			for ctx.Err() == nil {
+				select {
+				case <-ctx.Done():
+				case <-ticker.C:
+					o.retryTimedOutEvents(ctx)
+				}
+			}
+		})
 	}
 
 	for i := 0; i < o.parallelism; i++ {
-		go o.runDelivery(ctx)
+		wg.Go(func() {
+			o.runDelivery(ctx)
+		})
 	}
 
 	for i := 0; i < o.parallelism; i++ {
-		go o.runBatchedDeletes(ctx)
+		wg.Go(func() {
+			o.runBatchedDeletes(ctx)
+		})
 	}
 
-	<-ctx.Done()
+	wg.Wait()
 }
 
-// runDelivery continuously pulls from pendingIDs and delivers events
 func (o *Outbox) runDelivery(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case eventID := <-o.events.pendingIDs:
-			o.deliverEvent(eventID)
+			if evt, exists := o.events.GetEvent(eventID); exists {
+				o.workerFor(evt.Did).addEvent(ctx, evt)
+			}
 		}
 	}
-}
-
-func (o *Outbox) deliverEvent(eventID uint) {
-	evt, exists := o.events.GetEvent(eventID)
-	if !exists {
-		// Event was already acked/removed
-		return
-	}
-	o.workerFor(evt.Did).addEvent(evt)
 }
 
 // workerFor gets or creates the DIDWorker for the given DID.
 func (o *Outbox) workerFor(did string) *DIDWorker {
 	w, _ := o.didWorkers.LoadOrCompute(did, func() (*DIDWorker, bool) {
 		return &DIDWorker{
-			did:            did,
-			notifChan:      make(chan struct{}, 1),
-			inFlightSentAt: make(map[uint]time.Time),
-			outbox:         o,
-			ctx:            o.ctx,
+			did:       did,
+			notifChan: make(chan struct{}, 1),
+			inFlight:  make(map[uint]flightInfo),
+			outbox:    o,
 		}, false
 	})
 	return w
 }
 
-func (o *Outbox) sendEvent(evt *OutboxEvt) {
+func (o *Outbox) sendEvent(ctx context.Context, evt *OutboxEvt) {
 	eventsDelivered.Inc()
 	switch o.mode {
 	case OutboxModeFireAndForget, OutboxModeWebsocketAck:
-		o.outgoing <- evt
+		select {
+		case o.outgoing <- evt:
+		case <-ctx.Done():
+		}
 	case OutboxModeWebhook:
-		go o.webhook.Send(evt, o.AckEvent)
+		go o.webhook.Send(ctx, evt, o.AckEvent)
 	}
 }
 
 // AckEvent marks an event as delivered and queues it for deletion.
 func (o *Outbox) AckEvent(eventID uint) {
 	eventsAcked.Inc()
-	evt, exists := o.events.GetEvent(eventID)
-
-	if exists {
+	if evt, exists := o.events.GetEvent(eventID); exists {
 		if worker, ok := o.didWorkers.Load(evt.Did); ok {
 			worker.ackEvent(eventID)
 		}
 	}
-
 	o.acks <- eventID
 }
 
 func (o *Outbox) runBatchedDeletes(ctx context.Context) {
-	// drain every 10s as a fallback in the case of low-throughput ack queue
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	var batch []uint
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := o.events.DeleteEvents(ctx, batch); err != nil {
+			o.logger.Error("failed to delete batch of acked events", "error", err, "count", len(batch))
+		}
+		batch = nil
+	}
 
 	for {
 		select {
@@ -157,196 +169,176 @@ func (o *Outbox) runBatchedDeletes(ctx context.Context) {
 		case id := <-o.acks:
 			batch = append(batch, id)
 			if len(batch) >= 1000 {
-				if err := o.events.DeleteEvents(ctx, batch); err != nil {
-					o.logger.Error("failed to delete batch of acked events", "error", err, "count", len(batch))
-				}
-				batch = nil
+				flush()
 			}
 		case <-ticker.C:
-			if len(batch) > 0 {
-				if err := o.events.DeleteEvents(ctx, batch); err != nil {
-					o.logger.Error("failed to delete batch of acked events", "error", err, "count", len(batch))
-				}
-				batch = nil
-			}
+			flush()
 		}
 	}
 }
 
-func (o *Outbox) checkTimeouts(ctx context.Context) {
-	runPeriodically(ctx, o.retryTimeout, func(ctx context.Context) error {
-		o.retryTimedOutEvents()
-		return nil
-	})
-}
-
-// retryTimedOutEvents iterates through all workers and re-queues timed out events
-func (o *Outbox) retryTimedOutEvents() {
-	// Get snapshot of all active workers
+func (o *Outbox) retryTimedOutEvents(ctx context.Context) {
 	workers := make([]*DIDWorker, 0)
-	o.didWorkers.Range(func(key string, value *DIDWorker) bool {
-		workers = append(workers, value)
-		return true
+
+	o.didWorkers.Range(func(_ string, w *DIDWorker) bool {
+		workers = append(workers, w)
+		return ctx.Err() == nil
 	})
 
-	for _, worker := range workers {
-		timedOutIDs := worker.timedOutEvents()
-		for _, id := range timedOutIDs {
-			evt, exists := o.events.GetEvent(id)
-			if exists {
+	for _, w := range workers {
+		for _, id := range w.timedOutEvents() {
+			if evt, ok := o.events.GetEvent(id); ok {
 				o.logger.Info("retrying timed out event", "id", id)
-				o.sendEvent(evt)
+				o.sendEvent(ctx, evt)
 			}
 		}
+		if ctx.Err() != nil {
+			return
+		}
 	}
+}
+
+type flightInfo struct {
+	sentAt time.Time
+	isLive bool
 }
 
 type DIDWorker struct {
-	outbox         *Outbox
-	ctx            context.Context
-	did            string
-	notifChan      chan struct{}
-	pendingEvts    []uint
-	inFlightSentAt map[uint]time.Time
-	blockedOnLive  bool
-	running        bool
-	mu             sync.Mutex
+	outbox    *Outbox
+	did       string
+	notifChan chan struct{}
+
+	// Protected by mu
+	mu          sync.Mutex
+	pendingEvts []uint
+	inFlight    map[uint]flightInfo
+	liveCnt     int // Number of Live events currently in flight
+	running     bool
 }
 
-func (w *DIDWorker) run() {
+func (w *DIDWorker) run(ctx context.Context) {
 	for {
+		w.mu.Lock()
+		for len(w.pendingEvts) > 0 && w.liveCnt == 0 {
+			nextID := w.pendingEvts[0]
+			evt, exists := w.outbox.events.GetEvent(nextID)
+			if !exists {
+				w.pendingEvts = w.pendingEvts[1:]
+				continue
+			}
+			// Live event waits for all in-flight historical events to clear.
+			if evt.Live && len(w.inFlight) > 0 {
+				break
+			}
+			w.pendingEvts = w.pendingEvts[1:]
+			w.startFlight(evt)
+			w.mu.Unlock()
+			w.outbox.sendEvent(ctx, evt)
+			w.mu.Lock()
+		}
+
+		if w.isIdle() {
+			w.running = false
+			w.outbox.didWorkers.Delete(w.did)
+			w.mu.Unlock()
+			return
+		}
+
+		w.mu.Unlock()
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-w.notifChan:
 		}
-
-		w.processPendingEvts()
-
-		// Check if goroutine should exit
-		w.mu.Lock()
-		queueEmpty := len(w.pendingEvts) == 0
-		noInFlight := len(w.inFlightSentAt) == 0
-
-		if noInFlight {
-			w.blockedOnLive = false
-		}
-
-		if queueEmpty && noInFlight {
-			w.running = false
-			w.mu.Unlock()
-			return
-		}
-		w.mu.Unlock()
 	}
 }
 
-// get as many pending events in flight as we can
-// returns when it hits a blocking event
-func (w *DIDWorker) processPendingEvts() {
-	for {
-		select {
-		case <-w.ctx.Done():
-			return
-		default:
-		}
-
-		w.mu.Lock()
-		if w.blockedOnLive {
-			w.mu.Unlock()
-			return
-		}
-
-		if len(w.pendingEvts) == 0 {
-			w.mu.Unlock()
-			return
-		}
-		eventID := w.pendingEvts[0]
-		w.mu.Unlock()
-
-		evt, exists := w.outbox.events.GetEvent(eventID)
-		if !exists {
-			// Event was already acked/removed, skip it
-			w.mu.Lock()
-			w.pendingEvts = w.pendingEvts[1:]
-			w.mu.Unlock()
-			continue
-		}
-
-		w.mu.Lock()
-		if evt.Live {
-			hasInFlight := len(w.inFlightSentAt) > 0
-			// live event - must wait for all in-flight to clear
-			if hasInFlight {
-				w.mu.Unlock()
-				return
-			}
-
-			w.blockedOnLive = true
-		}
-		w.pendingEvts = w.pendingEvts[1:]
-		w.inFlightSentAt[eventID] = time.Now()
-		w.mu.Unlock()
-
-		w.outbox.sendEvent(evt)
-		if evt.Live {
-			return // not going to be able to send anymore in this loop so return for now
-		}
-	}
-}
-
-func (w *DIDWorker) addEvent(evt *OutboxEvt) {
+func (w *DIDWorker) addEvent(ctx context.Context, evt *OutboxEvt) {
 	w.mu.Lock()
 
-	hasInFlight := len(w.inFlightSentAt) > 0
-
-	// Fast path: no contention, send immediately without goroutine
-	if !hasInFlight {
-		w.inFlightSentAt[evt.ID] = time.Now()
+	// Resolve stale worker: between workerFor() and acquiring this lock, worker may need to re-register
+	for {
+		actual, _ := w.outbox.didWorkers.LoadOrCompute(w.did, func() (*DIDWorker, bool) {
+			return w, false
+		})
+		if actual == w {
+			break
+		}
 		w.mu.Unlock()
-		w.outbox.sendEvent(evt)
+		w = actual
+		w.mu.Lock()
+	}
+
+	// Fast path: send inline when idle.
+	if w.isIdle() {
+		w.startFlight(evt)
+		w.mu.Unlock()
+		w.outbox.sendEvent(ctx, evt)
 		return
 	}
 
-	// Slow path: contention exists, need goroutine for ordering
+	// Enqueue and ensure a drain goroutine is running.
 	w.pendingEvts = append(w.pendingEvts, evt.ID)
 	if !w.running {
 		w.running = true
-		go w.run()
+		go w.run(ctx)
 	}
 	w.mu.Unlock()
-
-	select {
-	case w.notifChan <- struct{}{}:
-	default:
-	}
+	w.signal()
 }
 
 func (w *DIDWorker) ackEvent(evtID uint) {
 	w.mu.Lock()
-	delete(w.inFlightSentAt, evtID)
-	w.mu.Unlock()
+	defer w.mu.Unlock()
 
-	select {
-	case w.notifChan <- struct{}{}:
-	default:
+	if info, ok := w.inFlight[evtID]; ok {
+		delete(w.inFlight, evtID)
+		if info.isLive {
+			w.liveCnt--
+		}
+	}
+	if !w.running && w.isIdle() {
+		w.outbox.didWorkers.Delete(w.did)
+		return
+	}
+	w.signal()
+}
+
+// startFlight marks an event as in-flight. Must be called with mu held.
+func (w *DIDWorker) startFlight(evt *OutboxEvt) {
+	w.inFlight[evt.ID] = flightInfo{sentAt: time.Now(), isLive: evt.Live}
+	if evt.Live {
+		w.liveCnt++
 	}
 }
 
-// checkAndRetryTimeouts checks for timed out events and returns their IDs
-// Must be called without holding w.mu
+// isIdle reports whether the worker has no pending or in-flight events.
+// Must be called with mu held.
+func (w *DIDWorker) isIdle() bool {
+	return len(w.pendingEvts) == 0 && len(w.inFlight) == 0
+}
+
 func (w *DIDWorker) timedOutEvents() []uint {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	var timedOut []uint
-	now := time.Now()
 
-	for evtId, sentAt := range w.inFlightSentAt {
-		if now.Sub(sentAt) > w.outbox.retryTimeout {
+	for evtId, info := range w.inFlight {
+		if time.Since(info.sentAt) > w.outbox.retryTimeout {
 			timedOut = append(timedOut, evtId)
+			// Reset sentAt so we don't re-detect on the next tick
+			info.sentAt = time.Now()
+			w.inFlight[evtId] = info
 		}
 	}
 
 	return timedOut
+}
+
+func (w *DIDWorker) signal() {
+	select {
+	case w.notifChan <- struct{}{}:
+	default:
+	}
 }

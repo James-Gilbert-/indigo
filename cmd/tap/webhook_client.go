@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,23 +16,29 @@ type WebhookClient struct {
 	httpClient    *http.Client
 }
 
-func (w *WebhookClient) Send(evt *OutboxEvt, ackFn func(uint)) {
-	retries := 0
-	for {
-		if err := w.post(evt); err != nil {
+func (w *WebhookClient) Send(ctx context.Context, evt *OutboxEvt, ackFn func(uint)) {
+	timer := time.NewTimer(0)
+	timer.Stop()
+	defer timer.Stop()
+
+	for retries := 0; ctx.Err() == nil; {
+		if err := w.Post(ctx, evt); err != nil {
 			w.logger.Warn("webhook failed, retrying", "error", err, "id", evt.ID, "retries", retries)
-			time.Sleep(backoff(retries, 10))
-			retries++
+			timer.Reset(backoff(retries, 10))
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+				retries++
+			}
 			continue
 		}
-
 		ackFn(evt.ID)
 		return
 	}
 }
 
-func (w *WebhookClient) post(evt *OutboxEvt) error {
-	req, err := http.NewRequest("POST", w.webhookURL, bytes.NewReader(evt.Event))
+func (w *WebhookClient) Post(ctx context.Context, evt *OutboxEvt) error {
+	req, err := http.NewRequestWithContext(ctx, "POST", w.webhookURL, bytes.NewReader(evt.Event))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
