@@ -48,12 +48,13 @@ type Splitter struct {
 }
 
 type SplitterConfig struct {
-	UpstreamHost      string
-	CollectionDirHost string
-	CursorFile        string
-	UserAgent         string
-	PebbleOptions     *pebblepersist.PebblePersistOptions
-	Logger            *slog.Logger
+	UpstreamHost        string
+	UpstreamIdleTimeout time.Duration
+	CollectionDirHost   string
+	CursorFile          string
+	UserAgent           string
+	PebbleOptions       *pebblepersist.PebblePersistOptions
+	Logger              *slog.Logger
 }
 
 func (sc *SplitterConfig) UpstreamHostWebsocket() string {
@@ -423,5 +424,5 @@ func (s *Splitter) handleUpstreamConnection(ctx context.Context, con *websocket.
 		return nil
 	})
 
-	return events.HandleRepoStream(ctx, con, sched, nil)
+	return events.HandleRepoStream(ctx, con, sched, nil, events.WithRepoStreamIdleTimeout(s.conf.UpstreamIdleTimeout))
 }

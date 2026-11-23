@@ -36,6 +36,7 @@ type FirehoseProcessor struct {
 	collectionFilters  []string
 	parallelism        int
 	cursorSaveInterval time.Duration
+	idleTimeout        time.Duration
 	noReplay           bool
 
 	lastSeq atomic.Int64
@@ -53,6 +54,7 @@ func NewFirehoseProcessor(logger *slog.Logger, db *gorm.DB, events *EventManager
 		collectionFilters:  config.CollectionFilters,
 		parallelism:        config.FirehoseParallelism,
 		cursorSaveInterval: config.FirehoseCursorSaveInterval,
+		idleTimeout:        config.FirehoseIdleTimeout,
 		noReplay:           config.NoReplay,
 	}
 }
@@ -470,7 +472,7 @@ func (fp *FirehoseProcessor) runConsumer(ctx context.Context) error {
 			fp.relayUrl,
 			rsc.EventHandler,
 		)
-		if err := events.HandleRepoStream(ctx, con, scheduler, nil); err != nil {
+		if err := events.HandleRepoStream(ctx, con, scheduler, nil, events.WithRepoStreamIdleTimeout(fp.idleTimeout)); err != nil {
 			fp.logger.Warn("firehose connection failed", "error", err)
 		}
 	}

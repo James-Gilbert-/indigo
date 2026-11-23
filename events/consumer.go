@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -105,11 +106,42 @@ func (sr *instrumentedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// HandleRepoStream
-// con is source of events
-// sched gets AddWork for each event
-// log may be nil for default logger
-func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler, log *slog.Logger) error {
+// ErrIdleTimeout is wrapped into the returned error when HandleRepoStream
+// times out waiting for a data frame (configured via WithRepoStreamIdleTimeout).
+var ErrIdleTimeout = errors.New("repo stream idle timeout")
+
+// RepoStreamOption configures HandleRepoStream.
+type RepoStreamOption func(*repoStreamConfig)
+
+type repoStreamConfig struct {
+	idleTimeout time.Duration
+}
+
+// WithRepoStreamIdleTimeout fails HandleRepoStream with an error wrapping
+// ErrIdleTimeout if no data frame arrives within d. Time spent in sched.AddWork
+// is not counted, and WebSocket pongs do not extend this deadline.
+// Choose d longer than the stream's longest legitimate quiet period; d <= 0 disables it.
+func WithRepoStreamIdleTimeout(d time.Duration) RepoStreamOption {
+	return func(cfg *repoStreamConfig) {
+		cfg.idleTimeout = d
+	}
+}
+
+func setReadDeadline(con *websocket.Conn, idleDeadline time.Time) error {
+	d := time.Now().Add(time.Minute)
+	if !idleDeadline.IsZero() && idleDeadline.Before(d) {
+		d = idleDeadline
+	}
+	return con.SetReadDeadline(d)
+}
+
+// HandleRepoStream consumes events from con and passes them to sched.
+// log may be nil for the default logger. Optional opts configure stream behavior.
+func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler, log *slog.Logger, opts ...RepoStreamOption) error {
+	var cfg repoStreamConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	if log == nil {
 		log = slog.Default().With("system", "events")
 	}
@@ -156,8 +188,11 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 		return err
 	})
 
+	// idleDeadline is only accessed on this goroutine: gorilla invokes
+	// SetPongHandler synchronously inside NextReader.
+	var idleDeadline time.Time
 	con.SetPongHandler(func(_ string) error {
-		if err := con.SetReadDeadline(time.Now().Add(time.Minute)); err != nil {
+		if err := setReadDeadline(con, idleDeadline); err != nil {
 			log.Error("failed to set read deadline", "err", err)
 		}
 
@@ -179,8 +214,18 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler,
 		default:
 		}
 
+		if cfg.idleTimeout > 0 {
+			idleDeadline = time.Now().Add(cfg.idleTimeout)
+			if err := setReadDeadline(con, idleDeadline); err != nil {
+				return fmt.Errorf("setting read deadline: %w", err)
+			}
+		}
+
 		mt, rawReader, err := con.NextReader()
 		if err != nil {
+			if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() && !idleDeadline.IsZero() && !time.Now().Before(idleDeadline) {
+				return fmt.Errorf("%w after %v: %w", ErrIdleTimeout, cfg.idleTimeout, err)
+			}
 			return fmt.Errorf("con err at read: %w", err)
 		}
 

@@ -55,6 +55,12 @@ func run(args []string) error {
 			Usage:   "URL (schema and hostname, no path) of the upstream host (eg, relay)",
 			Sources: cli.EnvVars("ATP_RELAY_HOST", "RAINBOW_RELAY_HOST"),
 		},
+		&cli.DurationFlag{
+			Name:    "upstream-idle-timeout",
+			Value:   2 * time.Minute,
+			Usage:   "reconnect if no upstream event arrives within this duration (0 to disable)",
+			Sources: cli.EnvVars("RAINBOW_UPSTREAM_IDLE_TIMEOUT"),
+		},
 		&cli.StringFlag{
 			Name:    "persist-db",
 			Value:   "./rainbow.db",
@@ -182,19 +188,21 @@ func runSplitter(ctx context.Context, cmd *cli.Command) error {
 			MaxBytes:        uint64(cmd.Int64("persist-bytes")),
 		}
 		conf := splitter.SplitterConfig{
-			UpstreamHost:      upstreamHost,
-			CollectionDirHost: collectionDirHost,
-			CursorFile:        cmd.String("cursor-file"),
-			PebbleOptions:     &ppopts,
-			UserAgent:         fmt.Sprintf("rainbow/%s (atproto-relay)", versioninfo.Short()),
+			UpstreamHost:        upstreamHost,
+			UpstreamIdleTimeout: cmd.Duration("upstream-idle-timeout"),
+			CollectionDirHost:   collectionDirHost,
+			CursorFile:          cmd.String("cursor-file"),
+			PebbleOptions:       &ppopts,
+			UserAgent:           fmt.Sprintf("rainbow/%s (atproto-relay)", versioninfo.Short()),
 		}
 		spl, err = splitter.NewSplitter(conf, nextCrawlers)
 	} else {
 		logger.Info("building in-memory splitter")
 		conf := splitter.SplitterConfig{
-			UpstreamHost:      upstreamHost,
-			CollectionDirHost: collectionDirHost,
-			CursorFile:        cmd.String("cursor-file"),
+			UpstreamHost:        upstreamHost,
+			UpstreamIdleTimeout: cmd.Duration("upstream-idle-timeout"),
+			CollectionDirHost:   collectionDirHost,
+			CursorFile:          cmd.String("cursor-file"),
 		}
 		spl, err = splitter.NewSplitter(conf, nextCrawlers)
 	}

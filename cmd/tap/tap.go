@@ -43,6 +43,7 @@ type TapConfig struct {
 	ResyncParallelism          int
 	OutboxParallelism          int
 	FirehoseCursorSaveInterval time.Duration
+	FirehoseIdleTimeout        time.Duration
 	NoReplay                   bool
 	RepoFetchTimeout           time.Duration
 	IdentityCacheSize          int

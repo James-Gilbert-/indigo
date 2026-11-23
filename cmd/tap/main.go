@@ -100,6 +100,12 @@ func run(args []string) error {
 						Value:   1 * time.Second,
 						Sources: cli.EnvVars("TAP_CURSOR_SAVE_INTERVAL"),
 					},
+					&cli.DurationFlag{
+						Name:    "firehose-idle-timeout",
+						Usage:   "reconnect if no firehose event arrives within this duration (0 to disable)",
+						Value:   2 * time.Minute,
+						Sources: cli.EnvVars("TAP_FIREHOSE_IDLE_TIMEOUT"),
+					},
 					&cli.BoolFlag{
 						Name:    "no-replay",
 						Usage:   "skip saved cursor and connect to firehose head on startup (incompatible with --full-network, not recommended for production)",
@@ -213,6 +219,7 @@ func runTap(ctx context.Context, cmd *cli.Command) error {
 		ResyncParallelism:          int(cmd.Int("resync-parallelism")),
 		OutboxParallelism:          int(cmd.Int("outbox-parallelism")),
 		FirehoseCursorSaveInterval: cmd.Duration("cursor-save-interval"),
+		FirehoseIdleTimeout:        cmd.Duration("firehose-idle-timeout"),
 		NoReplay:                   cmd.Bool("no-replay"),
 		RepoFetchTimeout:           cmd.Duration("repo-fetch-timeout"),
 		IdentityCacheSize:          int(cmd.Int("ident-cache-size")),
